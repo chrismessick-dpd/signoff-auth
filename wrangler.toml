@@ -1,0 +1,16 @@
+name = "signoff-auth"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# Never put GITHUB_CLIENT_SECRET here: `npx wrangler secret put GITHUB_CLIENT_SECRET`.
+[vars]
+ALLOWED_ORIGINS = "https://chrismessick-dpd.github.io"
+ALLOWED_REDIRECTS = "https://chrismessick-dpd.github.io/signoff/auth.html"
+
+[env.dev]
+name = "signoff-auth-dev"
+
+[env.dev.vars]
+ALLOWED_ORIGINS = "http://localhost:8774 http://localhost:8771"
+ALLOWED_REDIRECTS = "http://localhost:8774/signoff/auth.html http://localhost:8771/signoff/auth.html"

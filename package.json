@@ -1,0 +1,9 @@
+{
+  "name": "signoff-auth",
+  "private": true,
+  "type": "module",
+  "description": "Token exchange for the Signoff suite's Sign in with GitHub (a Cloudflare Worker).",
+  "scripts": {
+    "test": "node test.js"
+  }
+}
