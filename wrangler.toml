@@ -7,6 +7,8 @@ workers_dev = true
 [vars]
 ALLOWED_ORIGINS = "https://chrismessick-dpd.github.io"
 ALLOWED_REDIRECTS = "https://chrismessick-dpd.github.io/signoff/auth.html"
+# /invitations: GITHUB_APP_ID here or in the dashboard; never the key: `npx wrangler secret put GITHUB_APP_PRIVATE_KEY`.
+INVITE_OWNER = "chrismessick-dpd"
 
 [env.dev]
 name = "signoff-auth-dev"
@@ -14,3 +16,4 @@ name = "signoff-auth-dev"
 [env.dev.vars]
 ALLOWED_ORIGINS = "http://localhost:8774 http://localhost:8771"
 ALLOWED_REDIRECTS = "http://localhost:8774/signoff/auth.html http://localhost:8771/signoff/auth.html"
+INVITE_OWNER = "chrismessick-dpd"

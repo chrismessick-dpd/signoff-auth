@@ -1,11 +1,13 @@
 // signoff-auth: the token exchange behind the Signoff suite's "Sign in with GitHub".
 //
 // GitHub's token endpoint needs the GitHub App's client secret and has no CORS, so the suite's static
-// pages can't finish a sign-in on their own. This Worker holds the secret and does three things only:
+// pages can't finish a sign-in on their own. This Worker holds the secret and does four things only:
 //
 //   POST /exchange  {code, code_verifier, redirect_uri}  one-time code → access and refresh tokens
 //   POST /refresh   {refresh_token}                       a new token pair (the old refresh token dies)
 //   POST /revoke    {access_token}                        sign out: GitHub forgets the authorization
+//   POST /invitations {access_token}                      the caller's pending invitations on INVITE_OWNER's
+//                                                         private repos, which a sign-in token can't list
 //
 // It is not a proxy: no other route, no other GitHub call. It stores nothing and logs nothing.
 //
@@ -15,6 +17,9 @@
 //   ALLOWED_ORIGINS       space-separated page origins, e.g. "https://chrismessick-dpd.github.io"
 //   ALLOWED_REDIRECTS     space-separated callback URLs registered on the app, e.g.
 //                         "https://chrismessick-dpd.github.io/signoff/auth.html"
+//   GITHUB_APP_ID         /invitations only: the app's numeric App ID (not the client id)
+//   GITHUB_APP_PRIVATE_KEY  /invitations only: the app's private key, the whole .pem (type: Secret)
+//   INVITE_OWNER          /invitations only: the account whose repos are looked through, e.g. "chrismessick-dpd"
 
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 const GITHUB_API = 'https://api.github.com';
@@ -126,6 +131,152 @@ async function revoke(env, accessToken, origin, fetchImpl) {
   return fail(502, 'github_error', 'GitHub answered ' + res.status + '.', origin);
 }
 
+// ── /invitations ──────────────────────────────────────────────────────────────────────────────────
+// A sign-in token (ghu_) can accept an invitation to a private repo by its id, but GitHub hides the
+// invitation from that token's own list until it's accepted (the app reaches only repos the person can
+// already see). So the Worker looks them up as the app: it learns who is asking from their own token
+// (GET /user), then lists each private repo's pending invitations with an installation token and
+// returns only those addressed to that login. The page accepts them with the person's own token.
+
+const MAX_CALLS = 45;          // Cloudflare's free plan allows 50 outgoing requests per request
+const SCAN_BATCH = 6;
+
+function b64url(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlText(text) { return b64url(new TextEncoder().encode(text)); }
+
+// DER pieces, to wrap GitHub's PKCS#1 key ("BEGIN RSA PRIVATE KEY") as the PKCS#8 WebCrypto imports.
+function derLen(n) {
+  if (n < 0x80) return [n];
+  const out = [];
+  while (n > 0) { out.unshift(n & 0xff); n >>= 8; }
+  return [0x80 | out.length].concat(out);
+}
+function der(tag, body) {
+  const head = [tag].concat(derLen(body.length));
+  const out = new Uint8Array(head.length + body.length);
+  out.set(head, 0); out.set(body, head.length);
+  return out;
+}
+function concat(parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0), out = new Uint8Array(total);
+  let at = 0;
+  parts.forEach((p) => { out.set(p, at); at += p.length; });
+  return out;
+}
+export function pemToPkcs8(pem) {
+  const text = String(pem || '').replace(/\\n/g, '\n');
+  const m = text.match(/-----BEGIN (RSA )?PRIVATE KEY-----([\s\S]*?)-----END (RSA )?PRIVATE KEY-----/);
+  if (!m) throw new Error('not a PEM private key');
+  const bin = atob(m[2].replace(/\s+/g, ''));
+  const body = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) body[i] = bin.charCodeAt(i);
+  if (!m[1]) return body;   // already PKCS#8
+  const version = new Uint8Array([0x02, 0x01, 0x00]);
+  const algorithm = new Uint8Array([0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00]);
+  return der(0x30, concat([version, algorithm, der(0x04, body)]));
+}
+
+export async function appJwt(env, nowSec) {
+  const key = await crypto.subtle.importKey('pkcs8', pemToPkcs8(env.GITHUB_APP_PRIVATE_KEY),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+  const now = nowSec || Math.floor(Date.now() / 1000);
+  const head = b64urlText(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const body = b64urlText(JSON.stringify({ iat: now - 60, exp: now + 540, iss: String(env.GITHUB_APP_ID) }));
+  const sig = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(head + '.' + body)));
+  return head + '.' + body + '.' + b64url(sig);
+}
+
+// An installation token lasts an hour; keep it while this isolate lives (never stored anywhere else).
+let installCache = null;
+export function _forgetInstallation() { installCache = null; }
+
+function ghHeaders(auth) {
+  return {
+    'Accept': 'application/vnd.github+json',
+    'Content-Type': 'application/json',
+    'Authorization': auth,
+    'User-Agent': USER_AGENT,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
+
+async function invitations(env, accessToken, origin, fetchImpl) {
+  let calls = 0;
+  async function call(url, auth, init) {
+    if (calls >= MAX_CALLS) { const e = new Error('budget'); e.budget = true; throw e; }
+    calls++;
+    return fetchImpl(GITHUB_API + url, Object.assign({ headers: ghHeaders(auth) }, init || {}));
+  }
+  const owner = String(env.INVITE_OWNER).toLowerCase();
+  try {
+    // 1. Who is asking, and that the token is this app's (a pasted token lists its own invitations):
+    // GitHub's "check a token", with the app's client id and secret. Only their invitations come back.
+    const me = await call('/applications/' + encodeURIComponent(env.GITHUB_CLIENT_ID) + '/token',
+      'Basic ' + btoa(env.GITHUB_CLIENT_ID + ':' + env.GITHUB_CLIENT_SECRET),
+      { method: 'POST', body: JSON.stringify({ access_token: accessToken }) });
+    if (me.status === 404 || me.status === 422) return fail(401, 'bad_token', 'That isn’t a live Signoff sign-in.', origin);
+    if (!me.ok) return fail(502, 'github_error', 'GitHub answered ' + me.status + '.', origin);
+    const login = String(((await me.json()).user || {}).login || '').toLowerCase();
+    if (!login) return fail(502, 'github_error', 'GitHub didn’t say who you are.', origin);
+
+    // 2. The app's installation on the owner, and a read-only token for it.
+    const key = owner + ':' + env.GITHUB_APP_ID;
+    if (!installCache || installCache.key !== key || installCache.expires - Date.now() < 5 * 60000) {
+      const jwt = 'Bearer ' + await appJwt(env);
+      let inst = await call('/users/' + encodeURIComponent(owner) + '/installation', jwt);
+      if (inst.status === 404) inst = await call('/orgs/' + encodeURIComponent(owner) + '/installation', jwt);
+      if (!inst.ok) return fail(502, 'github_error', 'The app isn’t installed on ' + owner + ' (GitHub answered ' + inst.status + ').', origin);
+      const id = (await inst.json()).id;
+      const tok = await call('/app/installations/' + id + '/access_tokens', jwt, {
+        method: 'POST',
+        body: JSON.stringify({ permissions: { administration: 'read', metadata: 'read' } }),
+      });
+      if (!tok.ok) return fail(502, 'github_error', 'GitHub refused an installation token (' + tok.status + ').', origin);
+      const t = await tok.json();
+      installCache = { key, token: t.token, expires: Date.parse(t.expires_at) || Date.now() + 3600000 };
+    }
+    const inst = 'Bearer ' + installCache.token;
+
+    // 3. The private repos (public ones the person's own token already lists), newest first.
+    let repos = [], partial = false;
+    for (let page = 1; page <= 10; page++) {
+      const r = await call('/installation/repositories?per_page=100&page=' + page, inst);
+      if (!r.ok) return fail(502, 'github_error', 'GitHub answered ' + r.status + ' listing repositories.', origin);
+      const list = (await r.json()).repositories || [];
+      repos = repos.concat(list);
+      if (list.length < 100) break;
+    }
+    repos = repos.filter((r) => r.private && r.owner && String(r.owner.login).toLowerCase() === owner)
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+
+    // 4. Each one's pending invitations, keeping the caller's.
+    const out = [];
+    for (let i = 0; i < repos.length;) {
+      const room = MAX_CALLS - calls;
+      if (room <= 0) { partial = true; break; }
+      const batch = repos.slice(i, i + Math.min(SCAN_BATCH, room));
+      i += batch.length;
+      const answers = await Promise.all(batch.map((r) => call('/repos/' + r.full_name + '/invitations?per_page=100', inst)
+        .then(async (res) => (res.ok ? { r, list: await res.json() } : { r, list: [] }))));
+      answers.forEach(({ r, list }) => {
+        (Array.isArray(list) ? list : []).forEach((inv) => {
+          if (inv && inv.invitee && String(inv.invitee.login).toLowerCase() === login && !inv.expired) {
+            out.push({ id: inv.id, repo: r.full_name, created_at: inv.created_at || null });
+          }
+        });
+      });
+    }
+    return reply(200, { login, invitations: out, partial }, origin);
+  } catch (e) {
+    if (e && e.budget) return fail(502, 'github_error', 'Too many repositories to check at once.', origin);
+    return fail(502, 'github_unreachable', 'Could not reach GitHub. Try again.', origin);
+  }
+}
+
 export async function handle(request, env, fetchImpl) {
   fetchImpl = fetchImpl || fetch;
   if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
@@ -139,7 +290,7 @@ export async function handle(request, env, fetchImpl) {
   if (!allowed) return fail(403, 'origin_not_allowed', 'This origin may not use signoff-auth.', null);
 
   const route = url.pathname.replace(/\/+$/, '');
-  if (!['/exchange', '/refresh', '/revoke'].includes(route)) return fail(404, 'not_found', 'No such route.', origin);
+  if (!['/exchange', '/refresh', '/revoke', '/invitations'].includes(route)) return fail(404, 'not_found', 'No such route.', origin);
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(origin) });
   if (request.method !== 'POST') return fail(405, 'method_not_allowed', 'Use POST.', origin);
 
@@ -162,6 +313,12 @@ export async function handle(request, env, fetchImpl) {
   }
   const token = field(data, 'access_token');
   if (!token) return fail(400, 'bad_request', 'access_token is required.', origin);
+  if (route === '/invitations') {
+    if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY || !env.INVITE_OWNER) {
+      return fail(501, 'not_configured', 'This Worker doesn’t look up invitations (no app id, private key, or owner).', origin);
+    }
+    return invitations(env, token, origin, fetchImpl);
+  }
   return revoke(env, token, origin, fetchImpl);
 }
 

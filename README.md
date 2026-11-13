@@ -20,6 +20,18 @@ answer.
 | `/exchange` | `{code, code_verifier, redirect_uri}` | `{access_token, expires_in, refresh_token, refresh_token_expires_in, token_type, scope}` |
 | `/refresh` | `{refresh_token}` | the same, a new pair (the old refresh token stops working) |
 | `/revoke` | `{access_token}` | `{revoked: true}`, also when GitHub no longer knows the token |
+| `/invitations` | `{access_token}` | `{login, invitations: [{id, repo, created_at}], partial}` |
+
+`/invitations` (2026-11-12): a Sign in with GitHub token can accept an invitation to a private repo by
+its id, but GitHub leaves it out of that token's own list until it's accepted. So the Worker checks the token
+with GitHub's *check a token* (`POST /applications/{client_id}/token`, the client id and secret): it must
+be a live token of this app (a pasted token lists its own invitations), and GitHub says whose it is. Then, as the app (a JWT from the private key, then a read-only
+installation token, kept for its hour), lists the pending invitations of each private repo of
+`INVITE_OWNER`, newest repo first, and returns only the caller's. The page accepts them with its own
+token. It stays under Cloudflare's 50 outgoing requests per request (free plan) and says `partial: true`
+when it had to stop early. Newest repos go first, so past about 40 private repos the oldest (the data
+repos) are the ones left out; an organization (planned) makes this moot for FTEs. Without the three settings below it answers 501 and the other routes work as
+before. 401 means GitHub refused the caller's token.
 
 Errors are `{error, error_description}`:
 - 400: bad input, or GitHub refused the request (for example `bad_verification_code` or `bad_refresh_token`).
@@ -41,6 +53,9 @@ Set these under Cloudflare → Workers & Pages → `signoff-auth` → Settings �
 | `GITHUB_CLIENT_SECRET` | **Secret** | the GitHub App's client secret |
 | `ALLOWED_ORIGINS` | Text | page origins, space-separated |
 | `ALLOWED_REDIRECTS` | Text | callback URLs registered on the app, space-separated |
+| `GITHUB_APP_ID` | Text | the app's **App ID** (a number, on the app's General page; not the client id) |
+| `GITHUB_APP_PRIVATE_KEY` | **Secret** | the app's private key: the whole `.pem` file, BEGIN and END lines included |
+| `INVITE_OWNER` | Text | `chrismessick-dpd` (the account the app is installed on) |
 
 Production: `ALLOWED_ORIGINS` = `https://chrismessick-dpd.github.io`, and `ALLOWED_REDIRECTS` =
 `https://chrismessick-dpd.github.io/signoff/auth.html`.
@@ -76,7 +91,8 @@ node test.js
 ```
 
 The tests use Node 18 or later and need no packages. They check the three routes, the origin and
-input checks, GitHub errors and outages, and that the secret never comes back in an answer.
+input checks, GitHub errors and outages, and that the secret never comes back in an answer. The
+`/invitations` tests make a throwaway RSA key at run time and check the JWT's signature with it.
 
 ## What it never does
 
